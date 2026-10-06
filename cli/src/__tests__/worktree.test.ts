@@ -157,12 +157,12 @@ async function seedValidWorktreeSource(
     userId,
     role: "instance_admin",
   });
-  await db.insert(companies).values({
-    id: companyId,
-    name: "Seed Source",
-    issuePrefix: "SEED",
-    requireBoardApprovalForNewAgents: false,
-  });
+  // Seed only columns present in the historical source schema. The current
+  // model includes accounting columns that the worktree migration adds later.
+  await db.$client`
+    insert into companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+    values (${companyId}, 'Seed Source', 'SEED', false)
+  `;
   await db.insert(companyMemberships).values({
     companyId,
     principalType: "user",
@@ -1659,13 +1659,14 @@ describe("worktree helpers", () => {
         await sourceCluster.cleanup();
       });
       await ensurePostgresDatabase(sourceCluster.connectionString, "lagging_source");
-      // A lagging source must also have the prior schema. Deleting only the
-      // newest receipt from a fully migrated schema relied on that particular
-      // migration being idempotent and breaks when the new migration creates a
-      // table. Build the actual all-but-last schema before shuffling its history.
+      // Restore the schema before the lifecycle baseline repair, not merely
+      // before the latest migration: this fixture verifies that repair even
+      // when later migrations (including accounting) follow it.
       const migrationsRoot = new URL("../../../packages/db/src/migrations/", import.meta.url);
       const journal = JSON.parse(fs.readFileSync(new URL("meta/_journal.json", migrationsRoot), "utf8"));
-      const priorEntries = journal.entries.slice(0, -1);
+      const baselineIndex = journal.entries.findIndex((entry: { tag: string }) => entry.tag === "0309_loving_the_hood");
+      expect(baselineIndex).toBeGreaterThan(0);
+      const priorEntries = journal.entries.slice(0, baselineIndex);
       const priorMigrations = path.join(tempRoot, "prior-migrations");
       fs.mkdirSync(path.join(priorMigrations, "meta"), { recursive: true });
       fs.writeFileSync(path.join(priorMigrations, "meta", "_journal.json"), JSON.stringify({ ...journal, entries: priorEntries }));
@@ -1717,7 +1718,7 @@ describe("worktree helpers", () => {
       if (laggingMigrationState.status !== "needsMigrations") {
         throw new Error("Expected the source migration journal to lag the code journal");
       }
-      expect(laggingMigrationState.pendingMigrations).toHaveLength(1);
+      expect(laggingMigrationState.pendingMigrations).toHaveLength(journal.entries.length - priorEntries.length);
       const expectedAppliedPrefix = laggingMigrationState.availableMigrations.slice(
         0,
         laggingMigrationState.appliedMigrations.length,
